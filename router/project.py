@@ -37,9 +37,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
 from core.vector_config import pg_engine_langchain, embedding
 from fastapi import Request
-asyncio.set_event_loop_policy(
-    asyncio.WindowsSelectorEventLoopPolicy()
-)
+import sys
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(
+        asyncio.WindowsSelectorEventLoopPolicy()
+    )
 load_dotenv()
 
 project_router=APIRouter()
