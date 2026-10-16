@@ -1,0 +1,21 @@
+# Virtual environment
+myenv/
+venv/
+.venv/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE
+.vscode/
+
+# Vector database and local data
+chroma_db/
+
+# Uploaded files
+uploads/
