@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from schemas.project_schema import *
 from core.helper import is_authenticated
+from typing import Literal
 import cloudinary.uploader
 import core.s3_config
 from services.indexing import extract_project_source
@@ -24,6 +25,7 @@ import os
 import re
 from dotenv import load_dotenv
 import asyncio
+import uuid
 from core.s3_config import s3_client, S3_BUCKET_NAME
 from boto3.s3.transfer import TransferConfig
 from services.project_indexer import index_project
@@ -37,12 +39,18 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
 from core.vector_config import pg_engine_langchain, embedding
 from fastapi import Request
+from langchain_classic.retrievers import EnsembleRetriever
+from sentence_transformers import CrossEncoder
+from langgraph.store.postgres import PostgresStore
+from services.get_jev_relevance import evaluate_relevance
 import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(
         asyncio.WindowsSelectorEventLoopPolicy()
     )
 load_dotenv()
+
+DB_URI=os.getenv("DATABASE_URL")
 
 project_router=APIRouter()
 
@@ -54,12 +62,19 @@ embedding = GoogleGenerativeAIEmbeddings(
     model="models/gemini-embedding-001"
 )
 
-
+reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
 
 class ChatState(TypedDict):
     messages: list[AnyMessage]
     documents: list[Document]
+    reranked_docs:list[Document]
+    existing_memory:list[str]
+    should_store:str
+    extracted_text:str
     summary:str
+    jev_decision: str
+    jev_reason: str
+    retry_count: int
 
 # pg_engine.init_vectorstore_table(
 #     table_name="project_documents",
@@ -274,15 +289,8 @@ def create_conversation(project_id: int,current_user:UserModel=Depends(is_authen
 
     return conversation
 
-@project_router.get(
-"/conversation/{project_id}/",
-response_model=list[ConversationResponse]
-)
-def get_conversation(
-project_id: int,
-current_user: UserModel = Depends(is_authenticated),
-db: Session = Depends(get_db)
-):
+@project_router.get("/conversation/{project_id}/",response_model=list[ConversationResponse])
+def get_conversation(project_id: int,current_user: UserModel = Depends(is_authenticated),db: Session = Depends(get_db)):
 
     project = db.query(Project).filter(
     Project.id == project_id,
@@ -306,19 +314,13 @@ db: Session = Depends(get_db)
 
 
 @project_router.post("/chat/{conversation_id}/")
-def create_message(
-    conversation_id: int,
-    body: CreateMessage,
-    request: Request,
-    current_user: UserModel = Depends(is_authenticated),
-    db: Session = Depends(get_db)
-):
+def create_message(conversation_id: int,body: CreateMessage,request: Request,current_user: UserModel = Depends(is_authenticated),db: Session = Depends(get_db)):
     print("========== CHAT ENDPOINT HIT ==========", flush=True)
     conversation = db.query(Conversation).filter(
         Conversation.id == conversation_id,
         Conversation.user_id == current_user.id
     ).first()
-
+    project_id=conversation.project_id
     if not conversation:
         print("Conversation not found")
         raise HTTPException(
@@ -343,44 +345,212 @@ def create_message(
     db.commit()
     db.refresh(chat)
 
- 
+    def query_transform(state:ChatState):
+        question=state["messages"]
+        prompt=PromptTemplate.from_template("""
+            You are an expert query transformation assistant for a Retrieval-Augmented Generation (RAG) system.
+
+    Your task is to transform the user's original question into a clearer, more specific, and retrieval-friendly query.
+
+    Instructions:
+
+    1. Understand the user's original question.
+    2. Remove ambiguity and clarify the intent.
+    3. Preserve the original meaning.
+    4. Use relevant keywords to improve document retrieval.
+    5. Do not answer the question.
+    6. Do not introduce information that is not present in the original question.
+    7. Return only the transformed query without any explanation.
+
+    Original Question:
+    {question}
+
+    Transformed Query:
+
+
+    """)
+
+        result=prompt.invoke({"question":question})
+        transformed_query=llm.invoke(result)
+        print("==================TRANSFORMED QUERY==================")
+        print(transformed_query.content[0]["text"])
+        return {"messages":transformed_query.content[0]["text"]}
+    
+    def load_memory(state: ChatState):
+        with PostgresStore.from_conn_string(DB_URI) as store:
+            store.setup()
+
+            namespace = (f"user_{current_user.id}", "memories")
+
+            memories = store.search(
+                namespace=namespace,
+                limit=100
+            )
+
+            existing_memory = [
+                item.value["text"]
+                for item in memories
+                if "text" in item.value
+            ]
+
+            return {"existing_memory": existing_memory}
+
+    def is_memory_required(state:ChatState):
+        user_question=state["messages"][-1].content
+        existing_memory=state["existing_memory"]
+        prompt=PromptTemplate.from_template("""
+        You are a long-term memory decision system.
+
+                Determine whether the user's question should be added to long-term memory.
+
+                **Rules:**
+
+                * Return **YES** if the question contains useful information that is not already stored in memory.
+                * Return **NO** if the question is not useful to remember or the information is already stored in memory.
+                * Remember useful preferences, goals, coding preferences, and important project details.
+                * Ignore greetings, casual conversations, and temporary questions.
+                * Compare the user's question with existing memory before deciding.
+
+                **Examples:**
+
+                Example 1:
+                User Question: "I prefer using Python for development."
+                Existing Memory: No programming language preference stored.
+                Output: YES
+
+                Example 2:
+                User Question: "I prefer using Python for development."
+                Existing Memory: "The user prefers Python."
+                Output: NO
+
+                Example 3:
+                User Question: "What is the difference between lists and tuples?"
+                Existing Memory: No relevant information stored.
+                Output: NO
+
+                Example 4:
+                User Question: "My project uses PostgreSQL and LangGraph."
+                Existing Memory: "The user's project uses PostgreSQL."
+                Output: YES
+
+                Example 5:
+                User Question: "Hi, how are you?"
+                Existing Memory: No relevant information stored.
+                Output: NO
+
+                Example 6:
+                User Question: "I want to become an AI engineer."
+                Existing Memory: "The user wants to become an AI engineer."
+                Output: NO
+
+                **Input:**
+
+                User Question: {user_question}
+
+                Existing Memory: {existing_memory}
+
+                **Output:**
+
+                Return ONLY **YES** or **NO**. Do not provide explanations or additional text.
+
+
+                """)
+        result=prompt.invoke({"user_question":user_question,"existing_memory":existing_memory})
+        answer=llm.invoke(result)
+        return {"should_store":answer.content[0]["text"]}
+
+    def memory_decision_node(state:ChatState)->Literal["text_extraction","retreival_node",]:
+        if state["should_store"].lower()=="yes":
+             return "text_extraction"
+        else:
+             return "retreival_node"
+        
+    def text_extraction(state:ChatState):
+        question=state["messages"][-1].content
+        prompt=PromptTemplate.from_template("""
+                You are a long-term memory extraction system.
+
+                Extract useful, meaningful information from the user's message
+                and convert it into a short, clear, standalone statement.
+
+                Rules:
+                1. Write memories in third person, starting with "The user" where appropriate.
+                2. Preserve the original meaning without inventing information.
+                3. Remove unnecessary words and conversational language.
+                4. Extract preferences, interests, goals, skills, and important ongoing activities.
+                5. Ignore greetings, temporary questions, and irrelevant information.
+                6. If no useful memory exists, return NONE.
+                7. Return only the extracted memory, without explanations.
+
+                Examples:
+
+                User message: I love writing code in Python.
+                Memory: The user enjoys programming in Python.
+
+                User message: I am currently working on a Django project.
+                Memory: The user is currently working on a Django project.
+
+                User message: I want to become an AI engineer.
+                Memory: The user wants to become an AI engineer.
+
+                User message: Hi, how are you?
+                Memory: NONE
+
+                User message: What is the difference between lists and tuples?
+                Memory: NONE
+
+                User message: I use Python for backend development and prefer it over Java.
+                Memory: The user prefers Python over Java for backend development.
+
+                User message:
+                {user_message}
+                """)
+        result=prompt.invoke({"user_message":question})
+        answer=llm.invoke(result)
+        return {"extracted_text":answer.content[0]["text"]}
+    
+    def save_memory(state:ChatState):
+        
+        with PostgresStore.from_conn_string(DB_URI) as store:
+            store.setup()
+            namespace=(f"user_{current_user.id}","memories")
+            store.put(namespace,key=uuid.uuid4(),value={"text": state["extracted_text"]},
+            )
+
+        
+
+
 
     def retreival_node(state:ChatState):
         print("========== RETRIEVAL NODE STARTED ==========", flush=True)
         user_message = state["messages"][-1].content
-        match = re.search(
-        r"\b[\w.-]+\."
-        r"(?:py|js|jsx|ts|tsx|java|cpp|c|h|hpp|cs|php|go|rs|rb|swift|kt|html|css|sql|json|xml|yaml|yml|sh|ipynb)\b",
-        user_message,
-        re.IGNORECASE
-    )
-
-
-        file_name = match.group(0) if match else None
-
-    
-        if file_name:
-            rows = get_file_chunks(
-                project_id=conversation.project_id,
-                file_name=file_name
+        dense_retriever = get_retriever(project_id)
+        sparse_retriever = get_retriever()
+        hybrid_retriever=EnsembleRetriever(
+                retrievers=[dense_retriever,sparse_retriever],
+                weight=[0.5,0.5]
             )
-
-            result = [
-                Document(
-                    page_content=row[0],
-                    metadata=row[1] or {}
-                )
-                for row in rows
-            ]
-
-        else:
-            retriever = get_retriever()
-            result = retriever.invoke(user_message)
+        result = hybrid_retriever.invoke(user_message)
 
     
         return {"documents":result}
 
-
+    def reranking_node(state:ChatState):
+        query=state["messages"][-1].content
+        documents=state["documents"]
+        pairs=[(query,document.page_content) for document in documents]
+        scores=reranker.predict(pairs)
+        ranked_documents = sorted(
+        zip(documents, scores),
+        key=lambda x: x[1],
+        reverse=True
+    )
+        ranked_documents = [ document for document, scores in ranked_documents ]
+        print("==================RERANKED CHUNKS==================")
+        for doc in ranked_documents: 
+            print(doc.page_content)
+        
+        return {"reranked_docs":ranked_documents}
 
     system_prompt = """
         You are a helpful and intelligent codebase assistant.
@@ -415,31 +585,24 @@ def create_message(
             """
         )
     ])
-   
 
-    def history(state: ChatState):
+    def jev_node(state):
 
-        previous_messages = (
-            db.query(ChatMessage)
-            .filter(
-                ChatMessage.conversation_id == conversation_id,
-                ChatMessage.id < chat.id
-            )
-            .order_by(ChatMessage.id.asc())
-            .all()
-        )
-
-        if not previous_messages:
-            return {"summary": ""}
-
-        conversation_text = "\n".join(
-            f"{message.role}: {message.message}"
-            for message in previous_messages
+        score = evaluate_relevance(
+            state["question"],
+            state["reranked_docs"]
         )
 
         return {
-            "summary": conversation_text
+            "jev_score": score
         }
+    def route_after_jev(state)->Literal["generate_answer","retreival_node",]:
+
+        if state["jev_score"] >= 0.75:
+            return "generate_answer"
+
+        return "retreival_node"
+
 
 
     def generate_answer(state: ChatState):
@@ -519,13 +682,25 @@ def create_message(
     graph=StateGraph(ChatState)
 
 
+    graph.add_node("query_transform",query_transform) 
+    graph.add_node("load_memory",load_memory) 
+    graph.add_node("is_memory_required",is_memory_required) 
+    graph.add_node("text_extraction",text_extraction) 
+    graph.add_node("save_memory",save_memory) 
     graph.add_node("retreival_node",retreival_node) 
-    graph.add_node("history",history)
+    graph.add_node("reranking_node",reranking_node) 
+    graph.add_node("jev_node",jev_node) 
     graph.add_node("generate_answer",generate_answer) 
 
-    graph.add_edge(START,"retreival_node")
-    graph.add_edge("retreival_node","history")
-    graph.add_edge("history","generate_answer")
+    graph.add_edge(START,"query_transform")
+    graph.add_edge("query_transform","load_memory")
+    graph.add_edge("load_memory","is_memory_required")
+    graph.add_conditional_edges("is_memory_required",memory_decision_node,{"text_extraction":"text_extraction","retreival_node":"retreival_node"})
+    graph.add_edge("text_extraction","save_memory")
+    graph.add_edge("save_memory","retreival_node")
+    graph.add_edge("retreival_node","reranking_node")
+    graph.add_edge("reranking_node","jev_node")
+    graph.add_conditional_edges("jev_node",route_after_jev,{"generate_answer":"generate_answer","retreival_node":"retreival_node"})
     graph.add_edge("generate_answer",END)
 
     checkpointer = request.app.state.checkpointer

@@ -26,8 +26,8 @@ def index_project(
     # 2. Initialize the text splitter
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
+        chunk_size=1500,
+        chunk_overlap=200
     )
 
     documents = []
